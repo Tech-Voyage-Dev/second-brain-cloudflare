@@ -36,6 +36,8 @@ function graceMs(env: Env): number {
 const DUPLICATE_BLOCK_THRESHOLD = 0.95;
 const DUPLICATE_FLAG_THRESHOLD = 0.85;
 const CANDIDATE_SCORE_THRESHOLD = 0.45;
+const TAG_BOOST_STEP = 0.15;
+const TAG_BOOST_MAX = 1.5;
 
 // ─── Model constants ──────────────────────────────────────────────────────────
 
@@ -411,7 +413,8 @@ export function cosineSim(a: ArrayLike<number>, b: ArrayLike<number>): number {
 export function rerankWithTimeDecay(
   matches: VectorizeMatch[],
   recallCounts: Map<string, number> = new Map(),
-  importanceScores: Map<string, number> = new Map()
+  importanceScores: Map<string, number> = new Map(),
+  queryTags: string[] = []
 ): VectorizeMatch[] {
   const now = Date.now();
 
@@ -440,7 +443,12 @@ export function rerankWithTimeDecay(
       const imp = importanceScores.get(parentId) ?? 0;
       const importanceMultiplier = imp === 0 ? 1.0 : 0.8 + (imp / 5) * 0.4;
 
-      return { ...match, score: match.score * combinedMultiplier * appendPenalty * rolledUpPenalty * importanceMultiplier };
+      // Tag boost: applied outside the recency ≤1.0 cap so a tag-relevant memory can
+      // surface above a marginally-closer but irrelevant one.
+      const overlap = queryTags.length ? tags.filter(t => queryTags.includes(t)).length : 0;
+      const tagBoost = overlap ? Math.min(TAG_BOOST_MAX, 1 + overlap * TAG_BOOST_STEP) : 1.0;
+
+      return { ...match, score: match.score * combinedMultiplier * appendPenalty * rolledUpPenalty * importanceMultiplier * tagBoost };
     })
     .sort((a, b) => b.score - a.score);
 }
@@ -518,6 +526,43 @@ export function extractHashtags(content: string): { cleanContent: string; hashta
   const hashtags = (content.match(/#\w+/g) ?? []).map(t => t.slice(1).toLowerCase());
   const cleanContent = content.replace(/#\w+/g, '').replace(/\s+/g, ' ').trim();
   return { cleanContent, hashtags };
+}
+
+// ─── Query tag inference ──────────────────────────────────────────────────────
+
+export async function inferQueryTags(query: string, env: Env): Promise<string[]> {
+  const { hashtags } = extractHashtags(query);
+  if (hashtags.length) return hashtags;
+
+  const { results: tagRows } = await env.DB.prepare(
+    `SELECT DISTINCT value FROM entries, json_each(entries.tags) ORDER BY value`
+  ).all();
+  const knownTags = (tagRows as { value: string }[]).map(r => r.value);
+
+  const lowerQuery = query.toLowerCase();
+  const keywordMatches = knownTags.filter(t =>
+    new RegExp(`(?<![\\w-])${t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`, "i").test(lowerQuery)
+  );
+
+  if (keywordMatches.length) return keywordMatches;
+
+  if (!knownTags.length) return [];
+
+  try {
+    const stream = await env.AI.run(LLM_MODEL as any, {
+      messages: [{
+        role: "user",
+        content: `From this list of tags: ${knownTags.slice(0, 50).join(", ")}\n\nWhich tags best match this query? Reply with only a comma-separated list of matching tag names from the list, or nothing if none apply.\n\nQuery: ${query.slice(0, 300)}`,
+      }],
+      max_tokens: 100,
+      stream: true,
+    });
+    const text = await readStreamText(stream as ReadableStream);
+    const knownSet = new Set(knownTags);
+    return text.split(",").map(t => t.trim().toLowerCase()).filter(t => t && knownSet.has(t));
+  } catch {
+    return [];
+  }
 }
 
 // ─── Shared entry-listing filter builder ─────────────────────────────────────
@@ -932,7 +977,10 @@ export async function recallEntries(
     embedQuery = parsed.cleanQuery;
   }
 
-  const values = await embed(embedQuery, env);
+  const [values, queryTags] = await Promise.all([
+    embed(embedQuery, env),
+    inferQueryTags(embedQuery, env),
+  ]);
 
   let results: { matches: VectorizeMatch[] };
   if (tag) {
@@ -996,7 +1044,7 @@ export async function recallEntries(
   const recallCounts = new Map(rcRows.map(r => [r.id, r.recall_count ?? 0]));
   const importanceScores = new Map(rcRows.map(r => [r.id, r.importance_score ?? 0]));
 
-  const reranked = rerankWithTimeDecay(results.matches as VectorizeMatch[], recallCounts, importanceScores);
+  const reranked = rerankWithTimeDecay(results.matches as VectorizeMatch[], recallCounts, importanceScores, queryTags);
 
   const seen = new Set<string>();
   const deduped = reranked.filter((m) => {
