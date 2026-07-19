@@ -8,7 +8,7 @@ use crate::cf::backend::{DryRunBackend, LiveBackend};
 use crate::cf::oauth::{self, Tokens};
 use crate::cf::provision::{self, ProvisionError, ProvisionOutcome};
 use crate::cf::types::{Account, CfApiError};
-use crate::{mcp_config, secure_store, windows, worker_bundle};
+use crate::{mcp_config, password_check, secure_store, windows, worker_bundle};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -62,9 +62,12 @@ pub struct AppState {
 
 #[tauri::command]
 pub fn get_app_state(session: State<'_, SetupSession>) -> AppState {
+    // Dry-run is checked before the keychain read so demo mode never touches
+    // secure storage (each read can raise a macOS permission prompt for
+    // unsigned dev builds, which would block the setup UI's first paint).
     let mode = if *session.pending_worker_update.lock().unwrap() {
         "worker-update"
-    } else if secure_store::load_setup().is_some() && !session.dry_run {
+    } else if !session.dry_run && secure_store::load_setup().is_some() {
         "wrapper"
     } else {
         "setup"
@@ -73,6 +76,20 @@ pub fn get_app_state(session: State<'_, SetupSession>) -> AppState {
         mode,
         dry_run: session.dry_run,
     }
+}
+
+/// Strength + breach check for the password screen. Runs entirely in Rust so
+/// the password only crosses the IPC boundary the same way submit does; the
+/// breach lookup sends a 5-character hash prefix and nothing else.
+#[tauri::command]
+pub async fn check_password(password: String) -> Result<password_check::PasswordCheck, String> {
+    Ok(password_check::check(password.trim()).await)
+}
+
+/// A fresh strong password for the "generate one for me" button.
+#[tauri::command]
+pub fn generate_password() -> String {
+    password_check::generate()
 }
 
 #[tauri::command]
